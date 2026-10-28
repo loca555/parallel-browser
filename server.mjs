@@ -17,6 +17,12 @@ const GLOBAL_PAGES = Math.min(8, Math.max(2, Number(process.env.MAX_BROWSER_PAGE
 const MAX_SESSIONS = 8;
 const IDLE_MS = 10 * 60 * 1000;
 const MAX_AGE_MS = 60 * 60 * 1000;
+const INSTANCE_STARTED_AT = new Date().toISOString();
+const METADATA_REFRESH_MS = 1000;
+const FRAME_CACHE_MS = 350;
+const FRAME_STALE_MS = 30_000;
+let memoryCache;
+let memoryCacheAt = 0;
 const sessions = new Map();
 const retiringPages = new Set();
 let browserPromise;
@@ -31,6 +37,29 @@ function fail(status, code, message) { return Object.assign(new Error(message), 
 function json(res, status, value) { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}); res.end(JSON.stringify(value)); }
 function int(value, fallback, min, max) { const n=Number(value); return Number.isFinite(n)?Math.min(max,Math.max(min,Math.round(n))):fallback; }
 function totalPages() { return creating + retiringPages.size + [...sessions.values()].reduce((sum,s)=>sum+s.pages.size,0); }
+function operational(operation, code, status = 0) {
+ const safe = value => /^[a-z0-9_-]{1,60}$/i.test(String(value)) ? String(value).toLowerCase() : 'unknown';
+ console.warn(JSON.stringify({event:'browser_operation',operation:safe(operation),code:safe(code),status:Number.isInteger(status)?status:0}));
+}
+async function memorySnapshot(fresh = false) {
+ if (!fresh && memoryCache && Date.now()-memoryCacheAt<2000) return memoryCache;
+ let usedBytes=null,limitBytes=null;
+ for (const [usagePath,limitPath] of [['/sys/fs/cgroup/memory.current','/sys/fs/cgroup/memory.max'],['/sys/fs/cgroup/memory/memory.usage_in_bytes','/sys/fs/cgroup/memory/memory.limit_in_bytes']]) {
+  try {
+   const [usage,limit]=await Promise.all([fs.readFile(usagePath,'utf8'),fs.readFile(limitPath,'utf8')]);
+   const used=Number(usage.trim()),maximum=Number(limit.trim());
+   if(Number.isSafeInteger(used)&&used>=0)usedBytes=used;
+   if(Number.isSafeInteger(maximum)&&maximum>0&&maximum<2**50)limitBytes=maximum;
+   if(usedBytes!==null)break;
+  } catch {}
+ }
+ const usageRatio=usedBytes!==null&&limitBytes!==null?usedBytes/limitBytes:null;
+ memoryCache={usedBytes,limitBytes,nodeRssBytes:process.memoryUsage().rss,usageRatio};memoryCacheAt=Date.now();return memoryCache;
+}
+async function requireMemoryHeadroom() {
+ const memory=await memorySnapshot(true);
+ if(memory.usageRatio!==null&&memory.usageRatio>=0.88)throw fail(503,'browser_capacity_soft','The browser server is short on memory. Close another website panel or try again shortly.');
+}
 async function checkedUrl(value) {
  let url;
  try { url = await policy.validatePublicUrl(value); } catch(error) {if(error instanceof PublicUrlError)throw fail(400,error.code,error.message);throw error;}
@@ -49,9 +78,9 @@ async function browser() {
   proxyPromise ||= startPublicProxy({policy});
   browserPromise=proxyPromise.then(proxy=>chromium.launch({headless:true,chromiumSandbox:sandboxEnabled,proxy:{server:proxy.url,bypass:'<-loopback>'},args:['--proxy-bypass-list=<-loopback>','--disable-quic','--force-webrtc-ip-handling-policy=disable_non_proxied_udp','--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--no-first-run'],timeout:30_000})).then(instance=>{
    browserState='ready';
-   instance.on('disconnected',()=>{browserPromise=null;browserState='idle';for(const s of sessions.values())s.pages.clear();sessions.clear();retiringPages.clear();});
+   instance.on('disconnected',()=>{browserPromise=null;browserState='idle';for(const s of sessions.values())s.pages.clear();sessions.clear();retiringPages.clear();operational('browser','browser_disconnected',503);});
    return instance;
-  }).catch(error=>{browserPromise=null;browserState='failed';console.error('browser_launch_failed');throw fail(503,'browser_unavailable','The browser could not start. This host may not support Chromium sandboxing.');});
+  }).catch(error=>{browserPromise=null;browserState='failed';operational('browser_launch','browser_unavailable',503);throw fail(503,'browser_unavailable','The browser could not start. This host may not support Chromium sandboxing.');});
  }
  return browserPromise;
 }
@@ -62,6 +91,7 @@ async function createSession() {
  sessionCredits--;pendingSessions++;
  try {
   const b=await browser();
+  await requireMemoryHeadroom();
   const context=await b.newContext({viewport:{width:1440,height:900},deviceScaleFactor:1,acceptDownloads:false,serviceWorkers:'block',permissions:[],reducedMotion:'reduce',ignoreHTTPSErrors:false});
   await context.addInitScript(()=>{for(const name of ['RTCPeerConnection','webkitRTCPeerConnection','WebTransport']){try{Object.defineProperty(globalThis,name,{value:undefined,writable:false,configurable:false});}catch{}}});
   await context.route('**/*',async route=>{try{if(!['GET','HEAD'].includes(route.request().method()))throw fail(400,'read_only','Only read-only website requests are allowed.');await checkedUrl(route.request().url());await route.continue();}catch{await route.abort('blockedbyclient').catch(()=>{});}});
@@ -93,7 +123,7 @@ async function closeSession(session) {
 }
 function retire(record) {
  if(!record||record.retired)return;
- record.retired=true;record.image=null;record.session.pages.delete(record.id);record.session.requestPages.delete(record.requestId);retiringPages.add(record.page);
+ record.retired=true;record.image=null;record.lastImage=null;record.session.pages.delete(record.id);record.session.requestPages.delete(record.requestId);retiringPages.add(record.page);
  void record.page.close({runBeforeUnload:false}).catch(()=>{}).finally(()=>retiringPages.delete(record.page));
 }
 async function deadline(record,operation,ms=15_000) {
@@ -101,12 +131,47 @@ async function deadline(record,operation,ms=15_000) {
  try{return await Promise.race([Promise.resolve().then(operation),new Promise((_,reject)=>{timer=setTimeout(()=>{retire(record);reject(fail(503,'page_timed_out','This website stopped responding. Reload this panel to try again.'));},ms);})]);}
  finally{clearTimeout(timer);}
 }
-async function metadata(record) {
- return deadline(record,async()=>{
-  const viewport=record.page.viewportSize();
-  const [title,ratio]=await Promise.all([record.page.title(),record.page.evaluate(()=>scrollY/Math.max(1,Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)-innerHeight))]);
-  return {title:String(title).slice(0,512),url:record.page.url().slice(0,8192),viewport,scrollRatio:Number.isFinite(ratio)?Math.max(0,Math.min(1,ratio)):0};
- },3000);
+function metadataSnapshot(record) {
+ const previous=record.lastMetadata||{};
+ let url=previous.url||record.targetUrl||'',viewport=previous.viewport||{width:1440,height:900};
+ try {url=record.page.url()||url;} catch {}
+ try {viewport=record.page.viewportSize()||viewport;} catch {}
+ let fallbackTitle='Website';try{fallbackTitle=new URL(url).hostname||fallbackTitle;}catch{}
+ return {title:String(previous.title||fallbackTitle).slice(0,512),url:String(url).slice(0,8192),viewport,scrollRatio:Number.isFinite(previous.scrollRatio)?Math.max(0,Math.min(1,previous.scrollRatio)):0};
+}
+async function metadata(record, {force=false,waitMs=1500}={}) {
+ if(record.retired)return metadataSnapshot(record);
+ if(!record.metadataPromise&&(force||Date.now()-(record.metadataAttemptAt||0)>=METADATA_REFRESH_MS)) {
+  record.metadataAttemptAt=Date.now();
+  const generation=record.metadataGeneration||0;
+  let work;
+  work=Promise.allSettled([Promise.resolve().then(()=>record.page.title()),Promise.resolve().then(()=>record.page.evaluate(()=>scrollY/Math.max(1,Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)-innerHeight)))]).then(([title,ratio])=>{
+   if(!record.retired&&(record.metadataGeneration||0)===generation) {
+    const previous=metadataSnapshot(record);
+    record.lastMetadata={...previous,title:title.status==='fulfilled'?String(title.value).slice(0,512):previous.title,scrollRatio:ratio.status==='fulfilled'&&Number.isFinite(ratio.value)?Math.max(0,Math.min(1,ratio.value)):previous.scrollRatio};
+    if(title.status==='rejected'||ratio.status==='rejected')operational('metadata','metadata_unavailable',200);
+   }
+   return metadataSnapshot(record);
+  }).catch(()=>{if(!record.retired)operational('metadata','metadata_unavailable',200);return metadataSnapshot(record);}).finally(()=>{if(record.metadataPromise===work)record.metadataPromise=null;});
+  record.metadataPromise=work;
+ }
+ if(!record.metadataPromise)return metadataSnapshot(record);
+ let timer;
+ try{return await Promise.race([record.metadataPromise,new Promise(resolve=>{timer=setTimeout(()=>resolve(metadataSnapshot(record)),waitMs);})]);}
+ finally{clearTimeout(timer);}
+}
+async function browserFrame(record) {
+ if(record.image&&Date.now()-record.imageAt<FRAME_CACHE_MS)return {image:record.image,capturedAt:record.imageAt,stale:false};
+ try {
+  const image=await record.page.screenshot({type:'jpeg',quality:65,timeout:7000});
+  record.image=image;record.imageAt=Date.now();record.lastImage=image;record.lastImageAt=record.imageAt;record.frameFailures=0;
+  return {image,capturedAt:record.imageAt,stale:false};
+ } catch(error) {
+  if(record.retired||record.page.isClosed())throw fail(404,'page_not_found','This browser panel is no longer available.');
+  record.frameFailures=(record.frameFailures||0)+1;
+  if(record.lastImage&&Date.now()-record.lastImageAt<=FRAME_STALE_MS){if(record.frameFailures===1)operational('frame','frame_stale',200);return {image:record.lastImage,capturedAt:record.lastImageAt,stale:true};}
+  throw fail(503,'frame_timed_out','The browser is temporarily slow to refresh this page. Reconnecting shortly.');
+ }
 }
 function pageRecord(session,id) { const record=session.pages.get(id);if(!record)throw fail(404,'page_not_found','This browser panel is no longer available.');return record; }
 function queued(record,operation,ms=15_000) {
@@ -124,25 +189,27 @@ function cancelCreation(session,id) {
 }
 async function navigate(record,url) {
  const target=await checkedUrl(url);
+ record.metadataGeneration=(record.metadataGeneration||0)+1;record.targetUrl=target.href;record.lastMetadata={title:target.hostname,url:target.href,viewport:record.page.viewportSize(),scrollRatio:0};record.image=null;record.lastImage=null;
  try { const response=await record.page.goto(target.href,{waitUntil:'domcontentloaded',timeout:25_000});if(response && response.status()>=400)throw fail(502,'website_error','The website returned an error.'); }
  catch(error){if(error.status)throw error;throw fail(502,'navigation_failed','The website could not be opened in this browser preview.');}
- record.image=null;return metadata(record);
+ record.image=null;return metadata(record,{force:true});
 }
 async function makePage(session,body) {
  const creationId=requestId(body.requestId);
  if(session.cancelledRequests.has(creationId))throw fail(409,'creation_cancelled','This panel was closed before the website finished opening.');
  if(session.creations.has(creationId))throw fail(409,'creation_pending','This website is already opening.');
- const existing=session.requestPages.get(creationId);if(existing&&!existing.retired)return {pageId:existing.id,metadata:await queued(existing,()=>metadata(existing))};
+ const existing=session.requestPages.get(creationId);if(existing&&!existing.retired)return {pageId:existing.id,metadata:await metadata(existing)};
  if(session.pages.size>=MAX_PAGES)throw fail(409,'panel_limit','You can open up to eight panels.');
  if(totalPages()>=GLOBAL_PAGES)throw fail(503,'browser_capacity','All live browser slots are in use. Close a live website panel and try again.');
  const creation={cancelled:false,record:null};session.creations.set(creationId,creation);
  creating++;
  let page,record;
  try {
+  await requireMemoryHeadroom();
   await checkedUrl(body.url);
   if(creation.cancelled)throw fail(409,'creation_cancelled','This panel was closed before the website finished opening.');
   page=await session.context.newPage();page.setDefaultTimeout(5000);page.setDefaultNavigationTimeout(25_000);
-  const id=crypto.randomBytes(12).toString('hex');record={id,page,session,requestId:creationId,chain:Promise.resolve(),pending:0,retired:false,image:null,imageAt:0};creation.record=record;
+  const id=crypto.randomBytes(12).toString('hex');record={id,page,session,requestId:creationId,chain:Promise.resolve(),pending:0,retired:false,image:null,imageAt:0,lastImage:null,lastImageAt:0,lastMetadata:null,metadataPromise:null,metadataAttemptAt:0,metadataGeneration:0,frameFailures:0};creation.record=record;
   page.on('close',()=>{session.pages.delete(id);session.requestPages.delete(creationId);retiringPages.delete(page);});
   if(creation.cancelled){retire(record);throw fail(409,'creation_cancelled','This panel was closed before the website finished opening.');}
   await page.setViewportSize({width:int(body.width,1440,280,1920),height:int(body.height,900,280,1200)});
@@ -154,6 +221,7 @@ async function makePage(session,body) {
  } catch(error){if(record)retire(record);else if(page)void page.close().catch(()=>{});throw error;} finally {creating--;session.creations.delete(creationId);}
 }
 async function input(record,body) {
+ record.metadataGeneration=(record.metadataGeneration||0)+1;
  const viewport=record.page.viewportSize();const x=int(body.x,viewport.width/2,0,viewport.width-1),y=int(body.y,viewport.height/2,0,viewport.height-1);
  switch(body.type) {
   case 'click': await record.page.mouse.click(x,y,{button:['left','right','middle'].includes(body.button)?body.button:'left'});break;
@@ -161,10 +229,10 @@ async function input(record,body) {
   case 'key': if(typeof body.key!=='string'||body.key.length>50)throw fail(400,'invalid_key','Invalid key.');await record.page.keyboard.press(body.key);break;
   case 'text': if(typeof body.text!=='string'||body.text.length>4000)throw fail(400,'invalid_text','Text is too long.');await record.page.keyboard.insertText(body.text);break;
   case 'resize': await record.page.setViewportSize({width:int(body.width,1440,280,1920),height:int(body.height,900,280,1200)});break;
-  case 'scroll': {const ratio=Math.max(0,Math.min(1,Number(body.ratio)||0));await record.page.evaluate(value=>scrollTo(0,value*Math.max(0,Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)-innerHeight)),ratio);break;}
+  case 'scroll': {const ratio=Math.max(0,Math.min(1,Number(body.ratio)||0));await record.page.evaluate(value=>scrollTo(0,value*Math.max(0,Math.max(document.documentElement.scrollHeight,document.body?.scrollHeight||0)-innerHeight)),ratio);record.lastMetadata={...metadataSnapshot(record),scrollRatio:ratio};break;}
   default:throw fail(400,'invalid_input','Unsupported browser input.');
  }
- record.image=null;return metadata(record);
+ record.image=null;return metadata(record,{force:true});
 }
 const mime={'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'application/javascript; charset=utf-8','.svg':'image/svg+xml','.ttf':'font/ttf','.png':'image/png','.jpg':'image/jpeg','.json':'application/json; charset=utf-8'};
 async function serveStatic(req,res,url) {
@@ -175,19 +243,21 @@ async function serveStatic(req,res,url) {
  try {const data=await fs.readFile(target);res.writeHead(200,{'Content-Type':mime[path.extname(target)]||'application/octet-stream','X-Content-Type-Options':'nosniff','Cache-Control':'no-cache'});res.end(data);}catch(error){if(error.code==='ENOENT')throw fail(404,'not_found','Not found.');throw error;}
 }
 const server=http.createServer(async(req,res)=>{
+ let operation='request';
  try {
   const url=new URL(req.url,'http://localhost');
   if(url.pathname.startsWith('/api/') && req.headers.origin) {
    let origin;try{origin=new URL(req.headers.origin);}catch{throw fail(403,'invalid_origin','Invalid request origin.');}
    if(origin.host!==req.headers.host)throw fail(403,'invalid_origin','Open Parallel directly to use the browser preview.');
   }
-  if(url.pathname==='/healthz')return json(res,200,{ok:true,service:'parallel-browser',browserState,sandbox:sandboxEnabled,mode:publicBrowsing?'public':'allowlist',pages:totalPages()});
-  if(req.method==='POST'&&url.pathname==='/api/sessions'){const {token}=await createSession();return json(res,201,{token,limits:{maxPages:MAX_PAGES,globalPages:GLOBAL_PAGES,idleSeconds:IDLE_MS/1000},mode:publicBrowsing?'public':'allowlist',allowedHosts:publicBrowsing?null:[...hosts]});}
+  if(url.pathname==='/healthz')return json(res,200,{ok:true,service:'parallel-browser',browserState,sandbox:sandboxEnabled,mode:publicBrowsing?'public':'allowlist',pages:totalPages(),instanceStartedAt:INSTANCE_STARTED_AT,uptimeSeconds:Math.floor(process.uptime()),memory:await memorySnapshot()});
+  if(req.method==='POST'&&url.pathname==='/api/sessions'){operation='create_session';const {token}=await createSession();return json(res,201,{token,limits:{maxPages:MAX_PAGES,globalPages:GLOBAL_PAGES,idleSeconds:IDLE_MS/1000},mode:publicBrowsing?'public':'allowlist',allowedHosts:publicBrowsing?null:[...hosts]});}
   if(!url.pathname.startsWith('/api/')) {if(!['GET','HEAD'].includes(req.method))throw fail(405,'method_not_allowed','Method not allowed.');return await serveStatic(req,res,url);}
   const session=auth(req);
   if(req.method==='DELETE'&&url.pathname==='/api/session'){await closeSession(session);return json(res,200,{closed:true});}
   if(req.method==='POST'&&url.pathname==='/api/pages/cancel'){const body=await readJson(req);if(body.requestId===undefined)throw fail(400,'invalid_request_id','A browser request identifier is required.');cancelCreation(session,requestId(body.requestId));return json(res,200,{cancelled:true});}
   if(req.method==='POST'&&url.pathname==='/api/pages'){
+   operation='create_page';
    const body=await readJson(req);body.requestId=requestId(body.requestId);
    const cancel=()=>{if(!res.writableEnded)cancelCreation(session,body.requestId);};res.once('close',cancel);
    try{const result=await makePage(session,body);if(!res.destroyed)return json(res,201,result);return;}
@@ -197,15 +267,15 @@ const server=http.createServer(async(req,res)=>{
   if(!match)throw fail(404,'not_found','Not found.');
   const record=pageRecord(session,match[1]);
   if(req.method==='GET'&&match[2]==='frame') {
-   const image=await queued(record,async()=>{if(record.image&&Date.now()-record.imageAt<350)return record.image;record.image=await record.page.screenshot({type:'jpeg',quality:65,timeout:7000});record.imageAt=Date.now();return record.image;});
-   res.writeHead(200,{'Content-Type':'image/jpeg','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});return res.end(image);
+   operation='frame';const frame=await queued(record,()=>browserFrame(record));
+   res.writeHead(200,{'Content-Type':'image/jpeg','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Preview-Stale':frame.stale?'1':'0','X-Preview-Captured-At':String(frame.capturedAt)});return res.end(frame.image);
   }
-  if(req.method==='GET'&&!match[2])return json(res,200,{pageId:record.id,metadata:await queued(record,()=>metadata(record))});
+  if(req.method==='GET'&&!match[2]){operation='metadata';return json(res,200,{pageId:record.id,metadata:await metadata(record)});}
   if(req.method==='DELETE'&&!match[2]){retire(record);return json(res,200,{closed:true});}
-  if(req.method==='POST'&&match[2]==='navigate'){const body=await readJson(req);return json(res,200,{pageId:record.id,metadata:await queued(record,()=>navigate(record,body.url),30_000)});}
-  if(req.method==='POST'&&match[2]==='input'){const body=await readJson(req);return json(res,200,{pageId:record.id,metadata:await queued(record,()=>input(record,body))});}
+  if(req.method==='POST'&&match[2]==='navigate'){operation='navigate';const body=await readJson(req);return json(res,200,{pageId:record.id,metadata:await queued(record,()=>navigate(record,body.url),30_000)});}
+  if(req.method==='POST'&&match[2]==='input'){operation='input';const body=await readJson(req);return json(res,200,{pageId:record.id,metadata:await queued(record,()=>input(record,body))});}
   throw fail(405,'method_not_allowed','Method not allowed.');
- } catch(error) {if(res.destroyed)return;if(!res.headersSent)json(res,error.status||500,{error:error.status?error.message:'The browser request failed. Please try again.',code:error.code||'internal_error'});else res.end();}
+ } catch(error) {if((error.status||500)>=500)operational(operation,error.code||'internal_error',error.status||500);if(res.destroyed)return;if(!res.headersSent)json(res,error.status||500,{error:error.status?error.message:'The browser request failed. Please try again.',code:error.code||'internal_error'});else res.end();}
 });
 server.requestTimeout=30_000;server.headersTimeout=15_000;server.maxHeadersCount=30;
 setInterval(()=>{const now=Date.now();for(const session of sessions.values())if(now-session.touched>IDLE_MS||now-session.created>MAX_AGE_MS)void closeSession(session);},30_000).unref();

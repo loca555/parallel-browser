@@ -30,9 +30,35 @@ The default global page limit is 4; each session permits up to 8 panels but
 must fit within this shared limit. MAX_BROWSER_PAGES can be set from 2 to 8.
 Sessions expire after 10 minutes idle or one hour total. Tokens remain only in
 the browser client and Authorization headers, never in URLs or server logs.
-Each panel accepts at most eight queued operations. Metadata has a three-second
-deadline; other panel operations have a 15-second deadline (navigation 30).
-A timed-out panel is closed without terminating the other browser panels.
+Each panel accepts at most eight queued operations. Metadata is best effort:
+after 1.5 seconds it returns the cached title and scroll ratio with the current
+URL and viewport. Only one metadata request runs in the renderer at a time,
+including after this soft timeout; slow metadata never closes the panel.
+Navigation and input invalidate older metadata results. A completed scroll
+input also updates the cached ratio while fresh measurements are pending.
+
+JPEG capture has a seven-second timeout. On capture failure the last good JPEG
+can be reused for at most 30 seconds from its original capture time. Frame
+responses include X-Preview-Stale (0 or 1) and X-Preview-Captured-At (Unix ms).
+Without a recent image, the server returns JSON 503 with code frame_timed_out.
+Input and frame operations retain a hard 15-second deadline (navigation 30).
+A truly stuck operation closes its panel without closing the other panels.
+
+GET /healthz includes instanceStartedAt, uptimeSeconds, browser state and a
+best-effort memory object: usedBytes/limitBytes from Linux cgroups, usageRatio,
+and nodeRssBytes for the Node process alone. Unavailable cgroup values are null.
+At 88% of a known cgroup memory limit, new contexts or pages are rejected with
+JSON 503 browser_capacity_soft; existing panels are kept. This guard reduces
+pressure but cannot prevent every out-of-memory event or guarantee a particular
+number of heavy websites within a shared memory/CPU limit.
+Operational errors log bounded operation/code/status fields only, without
+website URLs, query strings, tokens, exception messages or typed input.
+
+The client keeps its last frame during temporary failures and retries after
+about 1, 2, 4, 8 and 15 seconds before offering manual Reload. Expired sessions and
+missing pages reconnect with the current URL, viewport and scroll position.
+Only a fresh frame resets this retry budget. Metadata refreshes independently
+at most once every five seconds; a slow metadata response never blocks a JPEG.
 
 Build: docker build -t parallel-remote .
 Local run with the official Playwright seccomp profile:
