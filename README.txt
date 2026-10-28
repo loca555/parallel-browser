@@ -15,6 +15,8 @@ No persistent profile, cookies or typed input are logged or saved to disk.
 POST /api/sessions -> token, limits, mode, allowedHosts.
 All subsequent /api routes require Authorization: Bearer <token>.
 POST /api/pages {url,width,height} -> pageId, metadata.
+An optional requestId makes creation idempotent. POST /api/pages/cancel
+{requestId} cancels pending or completed creation, including late responses.
 GET /api/pages/:id -> pageId, metadata.
 GET /api/pages/:id/frame -> image/jpeg, no-store.
 POST /api/pages/:id/navigate {url} -> pageId, metadata.
@@ -28,6 +30,9 @@ The default global page limit is 4; each session permits up to 8 panels but
 must fit within this shared limit. MAX_BROWSER_PAGES can be set from 2 to 8.
 Sessions expire after 10 minutes idle or one hour total. Tokens remain only in
 the browser client and Authorization headers, never in URLs or server logs.
+Each panel accepts at most eight queued operations. Metadata has a three-second
+deadline; other panel operations have a 15-second deadline (navigation 30).
+A timed-out panel is closed without terminating the other browser panels.
 
 Build: docker build -t parallel-remote .
 Local run with the official Playwright seccomp profile:

@@ -75,7 +75,7 @@ function layout(pane, preserve = true) {
 function resetPane(pane) {
  browserView.detachPane(pane);
  pane.generation++; pane.source = null; pane.frame = null; pane.image = null; pane.shell.replaceChildren(); pane.shell.removeAttribute('style'); pane.shell.classList.remove('frame-shell'); pane.stage.scrollTop = 0; pane.stage.scrollLeft = 0;
- pane.el.classList.add('empty'); pane.input.value = ''; $('.open-source',pane.el).disabled=true; pane.widthInput.disabled = false; pane.zoom.disabled = false; setProgress(pane, 0);
+ pane.el.classList.add('empty'); pane.input.value = ''; $('.open-source',pane.el).disabled=true; pane.widthInput.disabled = false; pane.widthInput.max = '3840'; pane.zoom.disabled = false; setProgress(pane, 0);
  $('.pane-heading h2', pane.el).textContent = 'Version ' + pane.label; $('.source-caption', pane.el).textContent = 'Website or mockup'; status(pane, 'Add a URL or file'); updateSyncUI(); browserView.cleanup();
 }
 function bridgeCode(channel) {
@@ -141,7 +141,7 @@ function normalizeUrl(raw) {
  return url;
 }
 function loadUrl(pane) {
- try { const url = normalizeUrl(pane.input.value); renderSource(pane, { kind:'remote', url:url.href, name:url.hostname }); cleanupBlobs(); } catch (error) { toast(error.message); }
+ try { const url = normalizeUrl(pane.input.value); if (browserView.navigate(pane, url)) return; renderSource(pane, { kind:'remote', url:url.href, name:url.hostname }); cleanupBlobs(); } catch (error) { toast(error.message); }
 }
 async function loadFile(pane, file) {
  if (!file) return;
@@ -249,6 +249,6 @@ $('#add-pane-button').addEventListener('click',()=>addPane());$('#reset-split').
 $('#focus-button').addEventListener('click',()=>{const active=document.body.classList.toggle('focus-mode');$('#focus-button').setAttribute('aria-pressed',String(active));});
 $('#help-button').addEventListener('click',()=>$('#help-dialog').showModal());$$('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));$$('dialog').forEach(dialog=>dialog.addEventListener('click',event=>{if(event.target===dialog){const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close()}}));
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&document.body.classList.contains('focus-mode')){document.body.classList.remove('focus-mode');$('#focus-button').setAttribute('aria-pressed','false')}});
-window.addEventListener('beforeunload',()=>ownedBlobs.forEach(uri=>URL.revokeObjectURL(uri)));
+window.addEventListener('pagehide',event=>{if(!event.persisted)ownedBlobs.forEach(uri=>URL.revokeObjectURL(uri));});
 browserView.configure({ panes, status, setProgress, userScrolled, updateSyncUI, viewportPadding, toast });
 panes.forEach(setupPane);refreshPanelGrid();panes.forEach(resetPane);

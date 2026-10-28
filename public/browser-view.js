@@ -10,6 +10,8 @@ window.ParallelBrowser = (() => {
  let pollAgain = false;
  let cleanupQueued = false;
  let stopping = false;
+ let sessionVersion = 0;
+ let pollEpoch = 0;
  const select = (selector, root) => root.querySelector(selector);
  const activePane = source => hooks.panes.find(pane => !pane.removed && pane.source === source);
  const stateOf = source => source.browser;
@@ -17,7 +19,7 @@ window.ParallelBrowser = (() => {
 
  async function fetchResponse(url, options = {}, token = sessionToken) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 35_000);
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? 35_000);
   const abort = () => controller.abort();
   if (options.signal?.aborted) abort();
   options.signal?.addEventListener('abort', abort, {once:true});
@@ -28,14 +30,14 @@ window.ParallelBrowser = (() => {
    const response = await fetch(url, {
     method: options.method || 'GET', headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
+    signal: controller.signal, cache: 'no-store', credentials: 'same-origin', keepalive: options.keepalive === true,
    });
    if (!response.ok) {
     let payload;
     try { payload = await response.json(); } catch {}
     const error = new Error(payload?.error || 'The browser preview could not respond. Please reload this panel.');
     error.code = payload?.code || 'request_failed'; error.status = response.status;
-    if (response.status === 401 && token === sessionToken) { sessionToken = ''; sessionPromise = null; }
+    if (response.status === 401 && token === sessionToken) { sessionVersion++; sessionToken = ''; sessionPromise = null; }
     throw error;
    }
    return response;
@@ -53,14 +55,19 @@ window.ParallelBrowser = (() => {
  async function ensureSession() {
   if (sessionToken) return sessionToken;
   if (!sessionPromise) {
-   sessionPromise = request('/api/sessions', {method:'POST'}, '').then(result => {
+   const version = sessionVersion;
+   sessionPromise = request('/api/sessions', {method:'POST',timeoutMs:75_000}, '').then(result => {
     if (!result.token) throw new Error('Browser view is unavailable on this host.');
+    if (stopping || version !== sessionVersion) {
+     void fetch('/api/session', {method:'DELETE',headers:{Authorization:'Bearer '+result.token},keepalive:true}).catch(() => {});
+     throw new DOMException('Browser session request was cancelled.', 'AbortError');
+    }
     sessionToken = result.token;
     const slots = Number(result.limits?.globalPages);
     const capacity = document.querySelector('#browser-capacity');
     if (capacity && Number.isFinite(slots)) capacity.textContent = 'Live-browser capacity: ' + slots + ' shared slots. Up to eight panels can hold websites, HTML files or images.';
     return sessionToken;
-   }).catch(error => { sessionPromise = null; throw error; });
+   }).catch(error => { if (version === sessionVersion) sessionPromise = null; throw error; });
   }
   return sessionPromise;
  }
@@ -79,10 +86,10 @@ window.ParallelBrowser = (() => {
   card.classList.toggle('error', error); card.hidden = false;
  }
  function hideMessage(pane) { const card = select('.browser-message', pane.shell); if (card) card.hidden = true; }
- function showError(source, error) {
+ function showError(source, error, retryPoll = false) {
   const state = stateOf(source); if (!state || state.closed || error.name === 'AbortError') return;
   const pane = activePane(source); if (!pane) return;
-  if (error.status === 429) { state.nextPoll = Date.now() + 3000; hooks.status(pane, 'Browser is busy · trying again shortly', 'external'); return; }
+  if (error.status === 429 && retryPoll && state.id) { state.nextPoll = Date.now() + 3000; hooks.status(pane, 'Browser is busy · trying again shortly', 'external'); return; }
   state.failed = true;
   hooks.status(pane, error.message || 'Browser view unavailable', 'error');
   message(pane, error.message || 'Please reload this panel.', true);
@@ -116,7 +123,7 @@ window.ParallelBrowser = (() => {
    state.nextPoll = 0; state.forceFrame = true;
    schedulePoll(250, true);
   });
-  state.chain = work.catch(error => showError(source, error));
+  state.chain = work.catch(error => { if (state.version === version) showError(source, error, true); });
   return work;
  }
  function requestedSize(pane) {
@@ -180,7 +187,7 @@ window.ParallelBrowser = (() => {
   image.addEventListener('keydown', event => {
    if (pane.source !== source || !stateOf(source).id || stateOf(source).failed) return;
    if (['Control','Shift','Meta','Alt'].includes(event.key)) return;
-   if (event.metaKey || (event.ctrlKey && ['w','t','l','r','n'].includes(event.key.toLowerCase()))) return;
+   if (event.metaKey || (event.ctrlKey && ['w','t','l','r','n','v'].includes(event.key.toLowerCase()))) return;
    event.preventDefault();
    if (event.key.length === 1 && event.key !== ' ' && !event.ctrlKey && !event.altKey) {
     queue(source, {type:'text',text:event.key}, true).catch(() => {});
@@ -200,6 +207,7 @@ window.ParallelBrowser = (() => {
   return {id:null, token:'', metadata:null, imageUri:'', closed:false, failed:false, version:1,
    ready:null, chain:Promise.resolve(), initialSize:null, pendingSize:null, resizeTimer:null,
    wheel:null,wheelTimer:null,scrollRatio:null,scrollTimer:null, frameController:null,
+   creating:false,requestId:'',creationController:null,restoreRatio:0,
    lastFrameAt:0,lastMetaAt:0,forceFrame:true,nextPoll:0,suppressUntil:0};
  }
  async function create(source) {
@@ -208,15 +216,41 @@ window.ParallelBrowser = (() => {
   if (state.closed || version !== state.version || !activePane(source)) return;
   state.token = token;
   const pane = activePane(source); const size = requestedSize(pane); state.initialSize = {width:size.width,height:size.height};
-  const result = await request('/api/pages', {method:'POST', body:{url:source.url, ...state.initialSize}}, token);
-  if (state.closed || version !== state.version || !activePane(source)) {
-   await request('/api/pages/' + encodeURIComponent(result.pageId), {method:'DELETE'}, token).catch(() => {}); return;
+  const requestId = crypto.randomUUID(); const controller = new AbortController();
+  state.requestId = requestId; state.creationController = controller; state.creating = true;
+  try {
+   let result = await request('/api/pages', {method:'POST', body:{url:source.url,requestId,...state.initialSize},signal:controller.signal,timeoutMs:75_000}, token);
+   if (state.closed || version !== state.version || !activePane(source)) {
+    void request('/api/pages/cancel', {method:'POST',body:{requestId}}, token).catch(() => {});
+    await request('/api/pages/' + encodeURIComponent(result.pageId), {method:'DELETE'}, token).catch(() => {}); return;
+   }
+   state.id = result.pageId;
+   if (state.restoreRatio > 0) {
+    state.suppressUntil = performance.now() + 2000;
+    result = await request('/api/pages/' + encodeURIComponent(state.id) + '/input', {method:'POST',body:{type:'scroll',ratio:state.restoreRatio}}, token);
+   }
+   if (state.closed || state.version !== version) return;
+   updateMetadata(source, result.metadata);
+   layout(activePane(source), false);
+   hooks.status(activePane(source), 'Browser view · click, scroll or type');
+   schedulePoll(0, true);
+  } catch (error) {
+   if (!state.id || state.closed || state.version !== version) void request('/api/pages/cancel', {method:'POST',body:{requestId},keepalive:state.closed}, token).catch(() => {});
+   throw error;
+  } finally {
+   if (state.requestId === requestId) { state.requestId = ''; state.creating = false; }
+   if (state.creationController === controller) state.creationController = null;
   }
-  state.id = result.pageId;
-  updateMetadata(source, result.metadata);
-  layout(activePane(source), false);
-  hooks.status(activePane(source), 'Browser view · click, scroll or type');
-  schedulePoll(0, true);
+ }
+ function startCreation(source) {
+  const state = stateOf(source); const version = state.version;
+  state.ready = create(source);
+  state.ready.catch(error => { if (state.version === version) showError(source,error); });
+  return state.ready;
+ }
+ function cancelPending(state, keepalive = false) {
+  state.creationController?.abort();
+  if (state.requestId && state.token) void request('/api/pages/cancel', {method:'POST',body:{requestId:state.requestId},keepalive}, state.token).catch(() => {});
  }
  function attach(pane, source) {
   if (!source.browser || source.browser.closed) source.browser = newState();
@@ -228,12 +262,11 @@ window.ParallelBrowser = (() => {
   pane.image = image; pane.shell.append(image); attachInput(pane, source, image);
   select('.source-caption', pane.el).textContent = 'Browser view · Chromium';
   if (state.imageUri) image.src = state.imageUri;
-  else { image.hidden = true; message(pane, 'Starting a browser and loading the page. This may take a moment.'); }
+  else { image.hidden = true; message(pane, 'Starting a browser and loading the page. The first start can take about a minute.'); }
   layout(pane, false);
   if (!state.ready) {
    hooks.status(pane, 'Opening browser view…');
-   state.ready = create(source);
-   state.ready.catch(error => showError(source, error));
+   startCreation(source);
   } else if (state.failed) message(pane, 'Please reload this browser panel.', true);
   else { hooks.status(pane, 'Browser view · click, scroll or type'); schedulePoll(); }
  }
@@ -245,6 +278,7 @@ window.ParallelBrowser = (() => {
   const state = stateOf(source); if (!state || state.closed) return;
   state.closed = true; state.version++;
   clearTimeout(state.resizeTimer); clearTimeout(state.wheelTimer); clearTimeout(state.scrollTimer);
+  cancelPending(state);
   state.frameController?.abort();
   if (state.imageUri) { URL.revokeObjectURL(state.imageUri); state.imageUri = ''; }
   sources.delete(source);
@@ -287,7 +321,7 @@ window.ParallelBrowser = (() => {
    hooks.status(pane, 'Browser view · click, scroll or type');
    state.lastFrameAt = Date.now();
    if (old) URL.revokeObjectURL(old);
-  } catch (error) { if (state.version === version) showError(source, error); }
+  } catch (error) { if (state.version === version) showError(source, error, true); }
   finally { state.frameController = null; }
  }
  function schedulePoll(delay = 2000, urgent = false) {
@@ -295,16 +329,18 @@ window.ParallelBrowser = (() => {
   if (polling) { if (urgent) pollAgain = true; return; }
   if (pollTimer && urgent) { clearTimeout(pollTimer); pollTimer = null; }
   if (pollTimer) return;
+  const epoch = pollEpoch;
   pollTimer = setTimeout(async () => {
    pollTimer = null;
-   if (stopping || document.hidden) return;
+   if (stopping || document.hidden || epoch !== pollEpoch) return;
    polling = true;
-   try { for (const source of sources) if (activePane(source)) await refreshSource(source); }
-   finally { polling = false; const urgentNext = pollAgain; pollAgain = false; if ([...sources].some(source => !stateOf(source).failed && !stateOf(source).closed)) schedulePoll(urgentNext ? 250 : 2000); }
+   try { for (const source of sources) { if (stopping || epoch !== pollEpoch) break; if (activePane(source)) await refreshSource(source); } }
+   finally { if (epoch === pollEpoch) { polling = false; const urgentNext = pollAgain; pollAgain = false; if ([...sources].some(source => !stateOf(source).failed && !stateOf(source).closed)) schedulePoll(urgentNext ? 250 : 2000); } }
   }, delay);
  }
  async function reload(pane) {
   const source = pane.source; const state = stateOf(source); if (!state || state.closed) return;
+  cancelPending(state);
   const version = ++state.version;
   state.failed = false; state.nextPoll = 0; state.frameController?.abort();
   clearTimeout(state.resizeTimer); clearTimeout(state.wheelTimer); clearTimeout(state.scrollTimer);
@@ -312,26 +348,60 @@ window.ParallelBrowser = (() => {
   message(pane, 'Reloading this browser page.'); hooks.status(pane, 'Reloading browser view…');
   try {
    if (state.id && state.token && state.token === sessionToken) {
-    const result = await request('/api/pages/' + encodeURIComponent(state.id) + '/navigate', {method:'POST',body:{url:source.url}}, state.token);
+    const result = await request('/api/pages/' + encodeURIComponent(state.id) + '/navigate', {method:'POST',body:{url:source.url},timeoutMs:75_000}, state.token);
     if (state.version !== version || state.closed) return;
-    updateMetadata(source, result.metadata); state.lastFrameAt = 0; state.forceFrame = true; schedulePoll(0, true);
+    state.ready = Promise.resolve(); state.chain = Promise.resolve(); updateMetadata(source, result.metadata); state.lastFrameAt = 0; state.forceFrame = true; schedulePoll(0, true);
    } else {
-    state.id = null; state.chain = Promise.resolve(); state.ready = create(source); await state.ready;
+    state.id = null; state.chain = Promise.resolve(); await startCreation(source);
    }
   } catch (error) {
+   if (state.closed || state.version !== version) return;
    if (error.status === 404 || error.status === 401) {
-    state.id = null; state.chain = Promise.resolve(); state.ready = create(source); state.ready.catch(next => showError(source,next));
+    state.id = null; state.chain = Promise.resolve(); startCreation(source);
    } else showError(source,error);
   }
+ }
+ function navigate(pane, url) {
+  if (pane.source?.kind !== 'remote') return false;
+  const source = pane.source; const state = stateOf(source);
+  if (!state || !state.id || state.closed || state.failed || state.token !== sessionToken) return false;
+  source.url = url.href; source.name = url.hostname; pane.input.value = url.href;
+  select('.pane-heading h2', pane.el).textContent = url.hostname;
+  if (pane.image) {
+   pane.image.alt = 'Browser preview of ' + source.name;
+   pane.image.setAttribute('aria-label', 'Interactive browser preview of ' + source.name + '. Click to interact, scroll or type.');
+  }
+  hooks.setProgress(pane, 0);
+  void reload(pane);
+  return true;
  }
  document.addEventListener('visibilitychange', () => {
   if (document.hidden) { clearTimeout(pollTimer); pollTimer = null; }
   else schedulePoll(0);
  });
  window.addEventListener('pagehide', () => {
-  stopping = true; clearTimeout(pollTimer);
-  for (const source of sources) { const state = stateOf(source); state.frameController?.abort(); if (state.imageUri) URL.revokeObjectURL(state.imageUri); }
-  if (sessionToken) void fetch('/api/session',{method:'DELETE',headers:{Authorization:'Bearer '+sessionToken},keepalive:true}).catch(()=>{});
+  stopping = true; sessionVersion++; pollEpoch++; clearTimeout(pollTimer); pollTimer = null; pollAgain = false; polling = false;
+  const token = sessionToken; sessionToken = ''; sessionPromise = null;
+  for (const source of sources) {
+   const state = stateOf(source); state.closed = true; state.version++;
+   clearTimeout(state.resizeTimer); clearTimeout(state.wheelTimer); clearTimeout(state.scrollTimer);
+   state.frameController?.abort(); cancelPending(state, true);
+   if (state.imageUri) { URL.revokeObjectURL(state.imageUri); state.imageUri = ''; }
+  }
+  sources.clear();
+  if (token) void fetch('/api/session',{method:'DELETE',headers:{Authorization:'Bearer '+token},keepalive:true}).catch(()=>{});
  });
- return {configure(value){hooks=value;},attach,detachPane,layout,scroll,cleanup,reload};
+ window.addEventListener('pageshow', event => {
+  if (!event.persisted || !stopping || !hooks) return;
+  stopping = false; pollEpoch++; polling = false; pollAgain = false;
+  for (const pane of hooks.panes) {
+   if (pane.removed || pane.source?.kind !== 'remote') continue;
+   const source = pane.source; source.browser = newState(); source.browser.restoreRatio = pane.ratio;
+   source.browser.suppressUntil = performance.now() + 2000;
+   pane.shell.replaceChildren(); pane.image = null; pane.frame = null;
+   attach(pane,source);
+  }
+  hooks.updateSyncUI();
+ });
+ return {configure(value){hooks=value;},attach,detachPane,layout,scroll,cleanup,reload,navigate};
 })();

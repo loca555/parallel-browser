@@ -12,6 +12,6 @@ services:
       - key: CHROMIUM_SANDBOX
         value: "1"
       - key: MAX_BROWSER_PAGES
-        value: "4"
+        value: "3"
       - key: NODE_OPTIONS
         value: --max-old-space-size=128
