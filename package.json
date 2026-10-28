@@ -1,0 +1,9 @@
+{
+  "name": "parallel-remote-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.mjs", "check": "node --check server.mjs" },
+  "engines": { "node": ">=22" },
+  "dependencies": { "playwright": "1.64.1" }
+}

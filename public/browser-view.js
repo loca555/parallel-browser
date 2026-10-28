@@ -1,0 +1,337 @@
+'use strict';
+
+window.ParallelBrowser = (() => {
+ const sources = new Set();
+ let hooks;
+ let sessionToken = '';
+ let sessionPromise;
+ let pollTimer;
+ let polling = false;
+ let pollAgain = false;
+ let cleanupQueued = false;
+ let stopping = false;
+ const select = (selector, root) => root.querySelector(selector);
+ const activePane = source => hooks.panes.find(pane => !pane.removed && pane.source === source);
+ const stateOf = source => source.browser;
+ const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+ async function fetchResponse(url, options = {}, token = sessionToken) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 35_000);
+  const abort = () => controller.abort();
+  if (options.signal?.aborted) abort();
+  options.signal?.addEventListener('abort', abort, {once:true});
+  const headers = {'Accept': options.image ? 'image/jpeg' : 'application/json'};
+  if (token) headers.Authorization = 'Bearer ' + token;
+  if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+  try {
+   const response = await fetch(url, {
+    method: options.method || 'GET', headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: controller.signal, cache: 'no-store', credentials: 'same-origin',
+   });
+   if (!response.ok) {
+    let payload;
+    try { payload = await response.json(); } catch {}
+    const error = new Error(payload?.error || 'The browser preview could not respond. Please reload this panel.');
+    error.code = payload?.code || 'request_failed'; error.status = response.status;
+    if (response.status === 401 && token === sessionToken) { sessionToken = ''; sessionPromise = null; }
+    throw error;
+   }
+   return response;
+  } catch (error) {
+   if (error.name === 'AbortError' && !options.signal?.aborted) {
+    throw new Error('The browser took too long to respond. Please reload this panel.');
+   }
+   throw error;
+  } finally {
+   clearTimeout(timeout);
+   options.signal?.removeEventListener('abort', abort);
+  }
+ }
+ async function request(url, options, token) { return (await fetchResponse(url, options, token)).json(); }
+ async function ensureSession() {
+  if (sessionToken) return sessionToken;
+  if (!sessionPromise) {
+   sessionPromise = request('/api/sessions', {method:'POST'}, '').then(result => {
+    if (!result.token) throw new Error('Browser view is unavailable on this host.');
+    sessionToken = result.token;
+    const slots = Number(result.limits?.globalPages);
+    const capacity = document.querySelector('#browser-capacity');
+    if (capacity && Number.isFinite(slots)) capacity.textContent = 'Live-browser capacity: ' + slots + ' shared slots. Up to eight panels can hold websites, HTML files or images.';
+    return sessionToken;
+   }).catch(error => { sessionPromise = null; throw error; });
+  }
+  return sessionPromise;
+ }
+ function message(pane, text, error = false) {
+  let card = select('.browser-message', pane.shell);
+  if (!card) {
+   card = document.createElement('div'); card.className = 'browser-message'; card.setAttribute('role', 'status');
+   const title = document.createElement('strong'); title.className = 'browser-message-title';
+   const body = document.createElement('span'); body.className = 'browser-message-body';
+   const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = 'Reload browser view';
+   retry.addEventListener('click', () => reload(pane)); card.append(title, body, retry); pane.shell.append(card);
+  }
+  select('strong', card).textContent = error ? 'Browser view unavailable' : 'Opening website';
+  select('.browser-message-body', card).textContent = text;
+  select('button', card).hidden = !error;
+  card.classList.toggle('error', error); card.hidden = false;
+ }
+ function hideMessage(pane) { const card = select('.browser-message', pane.shell); if (card) card.hidden = true; }
+ function showError(source, error) {
+  const state = stateOf(source); if (!state || state.closed || error.name === 'AbortError') return;
+  const pane = activePane(source); if (!pane) return;
+  if (error.status === 429) { state.nextPoll = Date.now() + 3000; hooks.status(pane, 'Browser is busy · trying again shortly', 'external'); return; }
+  state.failed = true;
+  hooks.status(pane, error.message || 'Browser view unavailable', 'error');
+  message(pane, error.message || 'Please reload this panel.', true);
+ }
+ function updateMetadata(source, metadata, userInput = false) {
+  const state = stateOf(source); const pane = activePane(source);
+  if (!state || state.closed || !pane || !metadata) return;
+  state.metadata = metadata;
+  state.lastMetaAt = Date.now();
+  if (metadata.title) select('.pane-heading h2', pane.el).textContent = metadata.title;
+  if (metadata.url && /^https?:\/\//i.test(metadata.url)) {
+   source.url = metadata.url;
+   if (document.activeElement !== pane.input) pane.input.value = metadata.url;
+  }
+  const ratio = Number(metadata.scrollRatio);
+  if (Number.isFinite(ratio) && Math.abs(ratio - pane.ratio) > .0005) {
+   if (!userInput && performance.now() < state.suppressUntil) hooks.setProgress(pane, ratio);
+   else hooks.userScrolled(pane, ratio);
+  }
+ }
+ function queue(source, input, userInput = false) {
+  const state = stateOf(source);
+  if (!state || state.closed || state.failed) return Promise.resolve();
+  const version = state.version;
+  const work = state.chain.catch(() => {}).then(async () => {
+   await state.ready;
+   if (state.closed || state.failed || state.version !== version || !state.id) return;
+   const result = await request('/api/pages/' + encodeURIComponent(state.id) + '/input', {method:'POST', body:input}, state.token);
+   if (state.closed || state.version !== version) return;
+   updateMetadata(source, result.metadata, userInput);
+   state.nextPoll = 0; state.forceFrame = true;
+   schedulePoll(250, true);
+  });
+  state.chain = work.catch(error => showError(source, error));
+  return work;
+ }
+ function requestedSize(pane) {
+  const padding = hooks.viewportPadding(pane);
+  const availableWidth = Math.max(70, pane.stage.clientWidth - padding.x);
+  const width = clamp(Math.round(pane.width), 280, 1920);
+  const scale = pane.zoom.value === 'fit' ? Math.min(1, availableWidth / width) : Number(pane.zoom.value);
+  const height = clamp(Math.floor((pane.stage.clientHeight - padding.y) / scale), 280, 1200);
+  return {width, height, scale};
+ }
+ function layout(pane, preserve = true) {
+  const source = pane.source; const state = stateOf(source);
+  if (!state || state.closed || pane.removed) return;
+  const size = requestedSize(pane);
+  pane.width = size.width; pane.widthInput.value = String(size.width); pane.scale = size.scale;
+  pane.shell.style.width = Math.round(size.width * size.scale) + 'px';
+  pane.shell.style.height = Math.round(size.height * size.scale) + 'px';
+  pane.zoom.title = (pane.zoom.value === 'fit' ? 'Fit to width: ' : 'Zoom: ') + Math.round(size.scale * 100) + '%';
+  const previous = state.pendingSize || state.metadata?.viewport || state.initialSize;
+  if (!previous || previous.width !== size.width || previous.height !== size.height) {
+   state.pendingSize = {width:size.width, height:size.height};
+   clearTimeout(state.resizeTimer);
+   state.resizeTimer = setTimeout(() => {
+    const pending = state.pendingSize; state.pendingSize = null;
+    if (state.closed || !pending || !state.id) return;
+    state.suppressUntil = performance.now() + 2000;
+    const previousRatio = pane.ratio;
+    queue(source, {type:'resize', ...pending}).then(() => {
+     if (preserve && activePane(source)) return queue(source, {type:'scroll', ratio:previousRatio});
+    }).catch(() => {});
+   }, 220);
+  }
+ }
+ function point(pane, event) {
+  const rect = pane.image.getBoundingClientRect();
+  const viewport = stateOf(pane.source).metadata?.viewport || stateOf(pane.source).initialSize;
+  return {
+   x: clamp(Math.round((event.clientX - rect.left) / Math.max(1, rect.width) * viewport.width), 0, viewport.width - 1),
+   y: clamp(Math.round((event.clientY - rect.top) / Math.max(1, rect.height) * viewport.height), 0, viewport.height - 1),
+  };
+ }
+ function attachInput(pane, source, image) {
+  image.addEventListener('click', event => {
+   if (pane.source !== source || !stateOf(source).id || stateOf(source).failed) return;
+   image.focus({preventScroll:true});
+   queue(source, {type:'click', ...point(pane, event), button:'left'}, true).catch(() => {});
+  });
+  image.addEventListener('wheel', event => {
+   if (pane.source !== source || !stateOf(source).id || stateOf(source).failed) return;
+   event.preventDefault();
+   const state = stateOf(source); const multiplier = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? pane.stage.clientHeight : 1;
+   if (!state.wheel) state.wheel = {deltaX:0,deltaY:0,...point(pane,event)};
+   state.wheel.deltaX += event.deltaX * multiplier / pane.scale;
+   state.wheel.deltaY += event.deltaY * multiplier / pane.scale;
+   Object.assign(state.wheel, point(pane,event));
+   if (!state.wheelTimer) state.wheelTimer = setTimeout(() => {
+    state.wheelTimer = null; const wheel = state.wheel; state.wheel = null;
+    if (wheel) queue(source, {type:'wheel',...wheel}, true).catch(() => {});
+   }, 160);
+  }, {passive:false});
+  image.addEventListener('keydown', event => {
+   if (pane.source !== source || !stateOf(source).id || stateOf(source).failed) return;
+   if (['Control','Shift','Meta','Alt'].includes(event.key)) return;
+   if (event.metaKey || (event.ctrlKey && ['w','t','l','r','n'].includes(event.key.toLowerCase()))) return;
+   event.preventDefault();
+   if (event.key.length === 1 && event.key !== ' ' && !event.ctrlKey && !event.altKey) {
+    queue(source, {type:'text',text:event.key}, true).catch(() => {});
+   } else {
+    const key = event.key === ' ' ? 'Space' : event.key;
+    const modifiers = [event.ctrlKey && 'Control',event.altKey && 'Alt',event.shiftKey && 'Shift'].filter(Boolean);
+    queue(source, {type:'key',key:[...modifiers,key].join('+')}, true).catch(() => {});
+   }
+  });
+  image.addEventListener('paste', event => {
+   if (pane.source !== source || !stateOf(source).id || stateOf(source).failed) return;
+   const text = event.clipboardData?.getData('text/plain'); if (!text) return;
+   event.preventDefault(); queue(source, {type:'text',text:text.slice(0,4000)}, true).catch(() => {});
+  });
+ }
+ function newState() {
+  return {id:null, token:'', metadata:null, imageUri:'', closed:false, failed:false, version:1,
+   ready:null, chain:Promise.resolve(), initialSize:null, pendingSize:null, resizeTimer:null,
+   wheel:null,wheelTimer:null,scrollRatio:null,scrollTimer:null, frameController:null,
+   lastFrameAt:0,lastMetaAt:0,forceFrame:true,nextPoll:0,suppressUntil:0};
+ }
+ async function create(source) {
+  const state = stateOf(source); const version = state.version;
+  const token = await ensureSession();
+  if (state.closed || version !== state.version || !activePane(source)) return;
+  state.token = token;
+  const pane = activePane(source); const size = requestedSize(pane); state.initialSize = {width:size.width,height:size.height};
+  const result = await request('/api/pages', {method:'POST', body:{url:source.url, ...state.initialSize}}, token);
+  if (state.closed || version !== state.version || !activePane(source)) {
+   await request('/api/pages/' + encodeURIComponent(result.pageId), {method:'DELETE'}, token).catch(() => {}); return;
+  }
+  state.id = result.pageId;
+  updateMetadata(source, result.metadata);
+  layout(activePane(source), false);
+  hooks.status(activePane(source), 'Browser view · click, scroll or type');
+  schedulePoll(0, true);
+ }
+ function attach(pane, source) {
+  if (!source.browser || source.browser.closed) source.browser = newState();
+  const state = stateOf(source); sources.add(source);
+  pane.shell.classList.add('browser-shell'); pane.stage.classList.add('browser-stage');
+  const image = document.createElement('img'); image.className = 'browser-image'; image.alt = 'Browser preview of ' + source.name;
+  image.tabIndex = 0; image.draggable = false; image.setAttribute('role','application');
+  image.setAttribute('aria-label','Interactive browser preview of ' + source.name + '. Click to interact, scroll or type.');
+  pane.image = image; pane.shell.append(image); attachInput(pane, source, image);
+  select('.source-caption', pane.el).textContent = 'Browser view · Chromium';
+  if (state.imageUri) image.src = state.imageUri;
+  else { image.hidden = true; message(pane, 'Starting a browser and loading the page. This may take a moment.'); }
+  layout(pane, false);
+  if (!state.ready) {
+   hooks.status(pane, 'Opening browser view…');
+   state.ready = create(source);
+   state.ready.catch(error => showError(source, error));
+  } else if (state.failed) message(pane, 'Please reload this browser panel.', true);
+  else { hooks.status(pane, 'Browser view · click, scroll or type'); schedulePoll(); }
+ }
+ function detachPane(pane) {
+  pane.shell.classList.remove('browser-shell'); pane.stage.classList.remove('browser-stage');
+  for (const notice of pane.stage.querySelectorAll('.embedding-notice')) notice.remove();
+ }
+ async function closeSource(source) {
+  const state = stateOf(source); if (!state || state.closed) return;
+  state.closed = true; state.version++;
+  clearTimeout(state.resizeTimer); clearTimeout(state.wheelTimer); clearTimeout(state.scrollTimer);
+  state.frameController?.abort();
+  if (state.imageUri) { URL.revokeObjectURL(state.imageUri); state.imageUri = ''; }
+  sources.delete(source);
+  if (state.id && state.token) await request('/api/pages/' + encodeURIComponent(state.id), {method:'DELETE'}, state.token).catch(() => {});
+ }
+ function cleanup() {
+  if (cleanupQueued || !hooks) return;
+  cleanupQueued = true;
+  queueMicrotask(() => {
+   cleanupQueued = false;
+   for (const source of sources) if (!activePane(source)) void closeSource(source);
+  });
+ }
+ function scroll(pane, ratio) {
+  const source = pane.source; const state = stateOf(source); if (!state || state.closed || state.failed) return;
+  state.scrollRatio = clamp(ratio,0,1); state.suppressUntil = performance.now() + 2000;
+  if (state.scrollTimer) return;
+  state.scrollTimer = setTimeout(() => {
+   state.scrollTimer = null; const target = state.scrollRatio; state.scrollRatio = null;
+   queue(source, {type:'scroll',ratio:target}).catch(() => {});
+  }, 100);
+ }
+ async function refreshSource(source) {
+  const state = stateOf(source); const version = state.version;
+  if (!state.id || state.closed || state.failed || !activePane(source) || Date.now() < state.nextPoll) return;
+  if (!state.forceFrame && Date.now() - state.lastFrameAt < 1900) return;
+  state.forceFrame = false;
+  state.frameController = new AbortController();
+  try {
+   if (Date.now() - state.lastMetaAt > 1500) {
+    const result = await request('/api/pages/' + encodeURIComponent(state.id), {signal:state.frameController.signal}, state.token);
+    if (state.closed || state.version !== version) return;
+    updateMetadata(source, result.metadata);
+   }
+   const response = await fetchResponse('/api/pages/' + encodeURIComponent(state.id) + '/frame', {image:true,signal:state.frameController.signal}, state.token);
+   const blob = await response.blob();
+   if (state.closed || state.version !== version || !activePane(source)) return;
+   const uri = URL.createObjectURL(blob); const old = state.imageUri; state.imageUri = uri;
+   const pane = activePane(source); pane.image.src = uri; pane.image.hidden = false; hideMessage(pane);
+   hooks.status(pane, 'Browser view · click, scroll or type');
+   state.lastFrameAt = Date.now();
+   if (old) URL.revokeObjectURL(old);
+  } catch (error) { if (state.version === version) showError(source, error); }
+  finally { state.frameController = null; }
+ }
+ function schedulePoll(delay = 2000, urgent = false) {
+  if (stopping || document.hidden || !hooks) return;
+  if (polling) { if (urgent) pollAgain = true; return; }
+  if (pollTimer && urgent) { clearTimeout(pollTimer); pollTimer = null; }
+  if (pollTimer) return;
+  pollTimer = setTimeout(async () => {
+   pollTimer = null;
+   if (stopping || document.hidden) return;
+   polling = true;
+   try { for (const source of sources) if (activePane(source)) await refreshSource(source); }
+   finally { polling = false; const urgentNext = pollAgain; pollAgain = false; if ([...sources].some(source => !stateOf(source).failed && !stateOf(source).closed)) schedulePoll(urgentNext ? 250 : 2000); }
+  }, delay);
+ }
+ async function reload(pane) {
+  const source = pane.source; const state = stateOf(source); if (!state || state.closed) return;
+  const version = ++state.version;
+  state.failed = false; state.nextPoll = 0; state.frameController?.abort();
+  clearTimeout(state.resizeTimer); clearTimeout(state.wheelTimer); clearTimeout(state.scrollTimer);
+  state.pendingSize = null; state.wheel = null; state.wheelTimer = null; state.scrollTimer = null;
+  message(pane, 'Reloading this browser page.'); hooks.status(pane, 'Reloading browser view…');
+  try {
+   if (state.id && state.token && state.token === sessionToken) {
+    const result = await request('/api/pages/' + encodeURIComponent(state.id) + '/navigate', {method:'POST',body:{url:source.url}}, state.token);
+    if (state.version !== version || state.closed) return;
+    updateMetadata(source, result.metadata); state.lastFrameAt = 0; state.forceFrame = true; schedulePoll(0, true);
+   } else {
+    state.id = null; state.chain = Promise.resolve(); state.ready = create(source); await state.ready;
+   }
+  } catch (error) {
+   if (error.status === 404 || error.status === 401) {
+    state.id = null; state.chain = Promise.resolve(); state.ready = create(source); state.ready.catch(next => showError(source,next));
+   } else showError(source,error);
+  }
+ }
+ document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { clearTimeout(pollTimer); pollTimer = null; }
+  else schedulePoll(0);
+ });
+ window.addEventListener('pagehide', () => {
+  stopping = true; clearTimeout(pollTimer);
+  for (const source of sources) { const state = stateOf(source); state.frameController?.abort(); if (state.imageUri) URL.revokeObjectURL(state.imageUri); }
+  if (sessionToken) void fetch('/api/session',{method:'DELETE',headers:{Authorization:'Bearer '+sessionToken},keepalive:true}).catch(()=>{});
+ });
+ return {configure(value){hooks=value;},attach,detachPane,layout,scroll,cleanup,reload};
+})();

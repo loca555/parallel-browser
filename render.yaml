@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: parallel-browser
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CHROMIUM_SANDBOX
+        value: "1"
+      - key: MAX_BROWSER_PAGES
+        value: "4"
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=128
